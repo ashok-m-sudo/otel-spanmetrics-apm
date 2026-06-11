@@ -1,0 +1,100 @@
+# Prometheus -- portfolio-minimal deployment.
+#
+# One replica, no PersistentVolumeClaim: metrics are EPHEMERAL and lost on pod
+# restart. That is deliberate -- this repo's story is the spanmetrics pipeline,
+# not Prometheus operations. Production setups should use kube-prometheus-stack
+# or the Prometheus Operator (persistent storage, HA, alerting, retention).
+#
+# Two notable choices:
+#   - The scrape target is the COLLECTOR'S SERVICE DNS, not a pod IP, so it
+#     survives collector pod restarts.
+#   - --enable-feature=exemplar-storage lets Prometheus retain the trace-ID
+#     exemplars the spanmetrics connector attaches to histogram data points,
+#     which is what makes Grafana's metric -> trace deep links work.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: observability
+  labels:
+    app: prometheus
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+      - job_name: 'otel-collector'
+        scrape_interval: 5s
+        static_configs:
+          - targets: ['central-otel-collector.observability.svc.cluster.local:8889']
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: observability
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+        - name: prometheus
+          image: prom/prometheus:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --enable-feature=exemplar-storage
+          ports:
+            - name: web
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9090
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: 9090
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: observability
+  labels:
+    app: prometheus
+spec:
+  type: ClusterIP
+  selector:
+    app: prometheus
+  ports:
+    - name: web
+      port: 9090
+      targetPort: 9090
+      protocol: TCP

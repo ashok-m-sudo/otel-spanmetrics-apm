@@ -1,0 +1,29 @@
+# Instrumentation custom resource for Node.js workloads.
+#
+# When a Deployment carries the annotation
+#   instrumentation.opentelemetry.io/inject-nodejs: observability/node-instrumentation
+# the OTel Operator injects an init container that copies the Node.js OTel SDK
+# into the app container and sets NODE_OPTIONS=--require ... so the SDK loads at
+# process startup -- with ZERO changes to the application source code.
+#
+# - exporter.endpoint  -> the OTel Collector's OTLP/HTTP service (see 03-otel-collector.yaml)
+# - propagators        -> tracecontext (W3C), baggage, b3 (interop). All services
+#                         MUST share this list so context propagates end to end.
+# - sampler            -> parentbased_traceidratio @ 1.0 = sample 100% (demo).
+#                         Honors upstream sampling decisions; dial argument down
+#                         (e.g. "0.1") in production.
+apiVersion: opentelemetry.io/v1alpha1
+kind: Instrumentation
+metadata:
+  name: node-instrumentation
+  namespace: observability
+spec:
+  exporter:
+    endpoint: "http://central-otel-collector.observability.svc.cluster.local:4318"
+  propagators:
+    - tracecontext
+    - baggage
+    - b3
+  sampler:
+    type: parentbased_traceidratio
+    argument: "1.0"

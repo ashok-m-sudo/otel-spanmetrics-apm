@@ -1,0 +1,104 @@
+# OpenTelemetryCollector custom resource -- DUAL-PIPELINE variant.
+#
+# This file extends the otel-zero-code-instrumentation-k8s central collector
+# with the spanmetrics connector. The Operator reconciles this CR into a
+# Deployment + Service whose DNS is
+#   central-otel-collector.observability.svc.cluster.local
+# (because metadata.name = "central-otel"; the operator appends "-collector").
+#
+# Three pipelines share the same OTLP receiver:
+#   1. traces            -> Jaeger      (visualization, full spans)
+#   2. traces/to_metrics -> spanmetrics connector (server spans only, for RED)
+#   3. metrics           -> Prometheus  (scrape target on :8889)
+#
+# See docs/architecture.md for the design rationale.
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: central-otel
+  namespace: observability
+spec:
+  image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:latest
+  # Expose the Prometheus exporter port on the generated Service. The Operator
+  # auto-exposes RECEIVER ports but not EXPORTER ports -- without this entry,
+  # Prometheus cannot reach :8889.
+  ports:
+    - name: prometheus
+      port: 8889
+      protocol: TCP
+  config:
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    connectors:
+      # SpanMetrics connector: converts spans -> RED metrics in-flight.
+      # Buckets are explicit (Prometheus histogram_quantile requires them).
+      # Dimensions become Prometheus labels -- be ruthless about cardinality:
+      # never dimension on user IDs, trace IDs, or URL paths containing IDs.
+      spanmetrics:
+        histogram:
+          explicit:
+            buckets: [2ms, 10ms, 50ms, 100ms, 200ms, 500ms, 1s, 5s]
+        dimensions:
+          - name: http.method
+          - name: http.status_code
+          - name: otel.library.name
+        exemplars:
+          enabled: true
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 75
+        spike_limit_percentage: 25
+      batch:
+        send_batch_size: 10000
+        timeout: 10s
+      # Shared by BOTH trace-side pipelines: drop probe / scrape noise.
+      filter/noise:
+        error_mode: ignore
+        traces:
+          span:
+            - attributes["http.target"] == "/health-check"
+            - attributes["http.target"] == "/health"
+            - attributes["http.target"] == "/metrics"
+      # METRICS-ONLY: keep ONLY inbound server spans. Counting client/internal
+      # spans would inflate the rate metric without adding signal -- you want
+      # exactly one RED observation per inbound request.
+      filter/entry_only:
+        error_mode: ignore
+        traces:
+          span:
+            - kind != SPAN_KIND_SERVER
+
+    exporters:
+      otlphttp:
+        endpoint: "http://jaeger-collector.observability.svc.cluster.local:4318"
+        tls:
+          insecure: true
+      prometheus:
+        endpoint: 0.0.0.0:8889
+        enable_open_metrics: true
+
+    service:
+      pipelines:
+        # 1. Trace visualization pipeline (full fidelity).
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, filter/noise, batch]
+          exporters: [otlphttp]
+        # 2. Trace -> metric derivation pipeline (server spans only).
+        traces/to_metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, filter/noise, filter/entry_only]
+          exporters: [spanmetrics]
+        # 3. Metric output pipeline (consumes from connector).
+        metrics:
+          receivers: [spanmetrics]
+          processors: [batch]
+          exporters: [prometheus]
